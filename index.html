@@ -1,0 +1,268 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Polygon Arbitrage Frontend — USDC FlashArb</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Inter, system-ui, Arial; max-width: 980px; margin: 24px auto; padding: 0 16px; color:#111 }
+    h1 { font-size:20px; margin-bottom:6px; }
+    label { display:block; margin-top:10px; font-size:13px; }
+    input, select, button { padding:8px; font-size:14px; margin-top:6px; width:100%; box-sizing:border-box; }
+    .row { display:flex; gap:8px; }
+    .small { width:140px; }
+    #log { white-space:pre-wrap; background:#0f1724; color:#d1fae5; padding:12px; border-radius:6px; margin-top:12px; max-height:360px; overflow:auto; font-family:monospace; font-size:13px; }
+    .ok { color:green } .bad { color:crimson }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.min.js"></script>
+</head>
+<body>
+  <h1>Polygon Arbitrage Frontend — USDC FlashArb</h1>
+
+  <div>
+    <label>Contract (read-only)</label>
+    <div id="contractAddr">0xC42293b1C5cFDd7D5cf2ad1c46704e706bb755f7</div>
+  </div>
+
+  <label>RPC / Network (Polygon)</label>
+  <select id="rpcSelect">
+    <option value="https://polygon-rpc.com">Polygon Mainnet (public)</option>
+    <option value="https://rpc.ankr.com/polygon">Polygon Mainnet (ankr)</option>
+    <option value="https://rpc-mumbai.maticvigil.com">Mumbai Testnet (use if contract is on Mumbai)</option>
+  </select>
+
+  <label>MetaMask / Wallet</label>
+  <button id="connectBtn">Connect Wallet</button>
+  <div id="walletInfo"></div>
+
+  <hr/>
+
+  <label>USDC token address (set to the USDC used by the contract)</label>
+  <input id="usdc" value="0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174" />
+
+  <label>USDC decimals (edit if needed; Polygon USDC = 6)</label>
+  <input id="usdcDecimals" value="6" />
+
+  <label>Routers to loop (UniswapV2-style routers). Edit as needed (comma separated)</label>
+  <input id="routers" value="0xa5E0829CaCEd8fFdd4De3c43696c57f7D7A678ff,0x1b02da8cb0d097eb8d57a175b88c7d8b47997506" />
+
+  <label>Tokens to test (comma separated addresses). First token is WETH-like or ERC20 target.</label>
+  <input id="tokens" value="0x7ceb23fd6bc0add59e62ac25578270cff1b9f619" />
+
+  <label>Amount in USDC (human) — small test amounts recommended</label>
+  <div class="row">
+    <input id="amountHuman" placeholder="e.g. 1.0" />
+    <button id="simulateBtn" class="small">Simulate all paths</button>
+  </div>
+
+  <label>Choose pair from simulation results</label>
+  <select id="simResults"></select>
+
+  <div class="row">
+    <button id="runBtn">Send executeArbitrage (selected)</button>
+    <button id="estimateGasBtn">Estimate Gas (selected)</button>
+  </div>
+
+  <label>Logs & receipts</label>
+  <div id="log">Logs will appear here...</div>
+
+<script>
+(async function(){
+  // CONTRACT & ABI (from user)
+  const CONTRACT_ADDRESS = "0xC42293b1C5cFDd7D5cf2ad1c46704e706bb755f7";
+  const CONTRACT_ABI = [
+    {"inputs":[{"internalType":"address","name":"buyRouter","type":"address"},{"internalType":"address","name":"sellRouter","type":"address"},{"internalType":"address","name":"token","type":"address"},{"internalType":"uint256","name":"amountIn","type":"uint256"}],"name":"executeArbitrage","outputs":[],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[{"internalType":"address","name":"asset","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"uint256","name":"premium","type":"uint256"},{"internalType":"address","name":"","type":"address"},{"internalType":"bytes","name":"params","type":"bytes"}],"name":"executeOperation","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[{"internalType":"address","name":"_aavePool","type":"address"},{"internalType":"address","name":"_usdc","type":"address"}],"stateMutability":"nonpayable","type":"constructor"},
+    {"inputs":[{"internalType":"address","name":"newOwner","type":"address"}],"name":"updateOwner","outputs":[],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[],"name":"withdrawProfits","outputs":[],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[{"internalType":"address","name":"tokenAddress","type":"address"}],"name":"withdrawToken","outputs":[],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[],"name":"AAVE_POOL","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"getContractBalance","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"owner","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"},
+    {"inputs":[],"name":"USDC","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}
+  ];
+
+  // Minimal UniswapV2-style router ABI bits we will call
+  const ROUTER_ABI = [
+    "function getAmountsOut(uint256 amountIn, address[] memory path) view returns (uint256[] memory amounts)",
+    "function swapExactTokensForTokens(uint amountIn,uint amountOutMin,address[] calldata path,address to,uint deadline) external returns (uint[] memory amounts)"
+  ];
+
+  // Utility helpers
+  const $ = id => document.getElementById(id);
+  const logEl = $("log");
+  function log(...args){ logEl.textContent += "\\n" + args.map(a => (typeof a === 'object' ? JSON.stringify(a,null,2): String(a))).join(" "); logEl.scrollTop = logEl.scrollHeight; }
+
+  let provider, signer, userAddress;
+  let contract;
+
+  // Wallet connect
+  $("connectBtn").onclick = async () => {
+    if (!window.ethereum) return alert("Please install MetaMask");
+    try {
+      await window.ethereum.request({ method: 'eth_requestAccounts' });
+      provider = new ethers.providers.Web3Provider(window.ethereum);
+      signer = provider.getSigner();
+      userAddress = await signer.getAddress();
+      $("walletInfo").textContent = userAddress;
+      contract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+      log("[wallet connected]", userAddress);
+    } catch (e) { log("[connect failed]", e.message || e); }
+  };
+
+  // Simulate all router pairs and show results
+  $("simulateBtn").onclick = async () => {
+    logEl.textContent = ""; // clear
+    const rpc = $("rpcSelect").value;
+    const rpcProvider = new ethers.providers.JsonRpcProvider(rpc);
+    const usdc = $("usdc").value.trim();
+    const decimals = Number($("usdcDecimals").value) || 6;
+    const amountHuman = Number($("amountHuman").value);
+    if (!amountHuman || amountHuman <= 0) return alert("Enter amount > 0");
+    const amountIn = ethers.utils.parseUnits(amountHuman.toString(), decimals);
+
+    const routersRaw = $("routers").value.split(",").map(s=>s.trim()).filter(Boolean);
+    const tokensRaw = $("tokens").value.split(",").map(s=>s.trim()).filter(Boolean);
+
+    const results = [];
+    log("Simulating for amount (raw):", amountIn.toString());
+
+    for (let buy of routersRaw){
+      for (let sell of routersRaw){
+        for (let token of tokensRaw){
+          try {
+            // first swap: USDC -> token via buy router
+            const buyRouter = new ethers.Contract(buy, ROUTER_ABI, rpcProvider);
+            const path1 = [usdc, token];
+            const amounts1 = await buyRouter.getAmountsOut(amountIn, path1);
+            const tokenReceived = amounts1[amounts1.length - 1];
+
+            // second swap: token -> USDC via sell router
+            const sellRouter = new ethers.Contract(sell, ROUTER_ABI, rpcProvider);
+            const path2 = [token, usdc];
+            const amounts2 = await sellRouter.getAmountsOut(tokenReceived, path2);
+            const finalUSDC = amounts2[amounts2.length -1];
+
+            // simulate profit
+            const profitRaw = finalUSDC.sub(amountIn);
+            const profitHuman = Number(ethers.utils.formatUnits(profitRaw, decimals));
+            const item = {
+              buy, sell, token,
+              amountIn: amountIn.toString(),
+              finalUSDC: finalUSDC.toString(),
+              profitRaw: profitRaw.toString(),
+              profitHuman
+            };
+            results.push(item);
+
+            const status = profitRaw.gte(0) ? (profitRaw.gt(0) ? "PROFIT" : "BREAKEVEN") : "LOSS";
+            log(`[Sim] buy=${short(buy)} sell=${short(sell)} token=${short(token)} => finalUSDC=${format(finalUSDC,decimals)} profit=${profitHuman} (${status})`);
+          } catch (err){
+            log(`[SimError] buy=${short(buy)} sell=${short(sell)} token=${short(token)} => ${err.message || err}`);
+          }
+        }
+      }
+    }
+
+    // populate selection with profitable or breakeven first
+    const sel = $("simResults");
+    sel.innerHTML = "";
+    results.sort((a,b)=> (Number(b.profitRaw) - Number(a.profitRaw)));
+    results.forEach((r, i) => {
+      const opt = document.createElement("option");
+      opt.value = JSON.stringify(r);
+      const label = `buy:${short(r.buy)} sell:${short(r.sell)} token:${short(r.token)} profit:${r.profitHuman}`;
+      opt.textContent = label;
+      sel.appendChild(opt);
+    });
+
+    if (results.length===0) log("No valid simulation results (check routers/tokens and RPC).");
+    else log("Simulation completed. Choose a path and click Send.");
+  };
+
+  // Estimate gas for selected path (callStatic attempt)
+  $("estimateGasBtn").onclick = async () => {
+    if (!contract || !signer) return alert("Connect wallet first");
+    const opt = $("simResults").value;
+    if (!opt) return alert("Run simulate first and select a path");
+    const r = JSON.parse(opt);
+    try {
+      const decimals = Number($("usdcDecimals").value) || 6;
+      const amountIn = r.amountIn; // already raw string
+      log("Estimating gas...");
+      const gas = await contract.estimateGas.executeArbitrage(r.buy, r.sell, r.token, amountIn);
+      log("Estimate gas:", gas.toString());
+    } catch(e){
+      log("Gas estimation error (likely revert):", e.message || e);
+    }
+  };
+
+  // Send executeArbitrage tx
+  $("runBtn").onclick = async () => {
+    if (!contract || !signer) return alert("Connect wallet first");
+    const opt = $("simResults").value;
+    if (!opt) return alert("Run simulate first and select a path");
+    const r = JSON.parse(opt);
+
+    // double-check simulation result before sending
+    const rpc = $("rpcSelect").value;
+    const rpcProvider = new ethers.providers.JsonRpcProvider(rpc);
+    const buyRouter = new ethers.Contract(r.buy, ROUTER_ABI, rpcProvider);
+    const sellRouter = new ethers.Contract(r.sell, ROUTER_ABI, rpcProvider);
+    const usdc = $("usdc").value.trim();
+    const decimals = Number($("usdcDecimals").value) || 6;
+    const amountIn = ethers.BigNumber.from(r.amountIn);
+
+    // Recompute simulated finalUSDC
+    try {
+      const amounts1 = await buyRouter.getAmountsOut(amountIn, [usdc, r.token]);
+      const tokenReceived = amounts1[amounts1.length-1];
+      const amounts2 = await sellRouter.getAmountsOut(tokenReceived, [r.token, usdc]);
+      const finalUSDC = amounts2[amounts2.length-1];
+      const profitRaw = finalUSDC.sub(amountIn);
+      log("[Pre-send simulation] finalUSDC=", format(finalUSDC,decimals), "profit=", Number(ethers.utils.formatUnits(profitRaw,decimals)));
+      // only proceed if profit >= 0 (breakeven allowed) — matches your contract
+      if (profitRaw.lt(0)) return alert("Simulation shows loss — will not send to protect contract balance.");
+
+      // Send tx
+      log("Sending executeArbitrage...");
+      const tx = await contract.executeArbitrage(r.buy, r.sell, r.token, amountIn, { gasLimit: 1200000 });
+      log("Tx sent:", tx.hash);
+      log("Waiting for confirmation...");
+      const receipt = await tx.wait();
+      log("Tx mined:", receipt.transactionHash, "status:", receipt.status);
+      log("Gas used:", receipt.gasUsed.toString(), "cumulative:", receipt.cumulativeGasUsed.toString());
+      log("Logs (raw):", receipt.logs);
+      // show parsed logs
+      try {
+        const abi = new ethers.utils.Interface(CONTRACT_ABI);
+        receipt.logs.forEach((l) => {
+          try {
+            const parsed = abi.parseLog(l);
+            log("Parsed log:", parsed.name, parsed.args);
+          } catch(e){}
+        });
+      } catch(e){
+        log("No contract events to parse or parse failed.");
+      }
+      // Print contract balance after tx
+      const provider2 = new ethers.providers.Web3Provider(window.ethereum);
+      const contractReadonly = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider2);
+      const cb = await contractReadonly.getContractBalance();
+      log("Contract USDC balance (raw):", cb.toString());
+    } catch(err){
+      log("Error during pre-send or tx:", err.message || err);
+    }
+  };
+
+  // small helpers
+  function short(addr){ return addr.slice(0,8)+"..."+addr.slice(-6) }
+  function format(bn, dec){ try { return ethers.utils.formatUnits(bn.toString(), dec); } catch(e){ return bn.toString(); } }
+
+  // load initial
+  log("Frontend loaded. Set routers, tokens, amount and Connect Wallet.");
+})();
+</script>
+</body>
+</html>
